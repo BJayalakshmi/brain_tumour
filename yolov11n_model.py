@@ -236,19 +236,22 @@ class YOLO11n(nn.Module):
         self.sppf = SPPF(c(128), c(128), k=5)
 
         # We'll produce three feature maps:
-        # p3: from stage2 (shallow, /8 or /16 depending)
-        # p4: from stage3 (/16)
-        # p5: from sppf (/16 with deeper receptive field)
-        # For simplicity and easy modification we adjust scales modestly
+        # p3: from stage1 (shallow)  -> outputs c(32)
+        # p4: from stage2 (mid)      -> outputs c(64)
+        # p5: from sppf / stage3     -> outputs c(128)
         # Project channels to unify neck channel size
         neck_c = c(128)
-        self.proj_p3 = Conv(c(64), neck_c, k=1)
-        self.proj_p4 = Conv(c(128), neck_c, k=1)
-        self.proj_p5 = Conv(c(128), neck_c, k=1)
+        # NOTE: use the actual channel counts produced by each stage for projection
+        self.proj_p3 = Conv(c(32), neck_c, k=1)   # stage1 outputs 32 channels
+        self.proj_p4 = Conv(c(64), neck_c, k=1)   # stage2 outputs 64 channels
+        self.proj_p5 = Conv(c(128), neck_c, k=1)  # stage3/SPPF outputs 128 channels
 
+        # neck expects channels tuple (p3, p4, p5) -> use unified neck_c for simplicity
         self.neck = SimplePAN((neck_c, neck_c, neck_c))
-        # head channels = channels returned by neck: small, medium, large.
-        head_ch = (c(64), c(128), c(128))  # these are target channels for predict convs
+
+        # head channels should match the outputs of the neck (which are produced by out_small/out_medium/out_large)
+        # Since SimplePAN was created with (neck_c, neck_c, neck_c), its outputs will have neck_c channels -> use that.
+        head_ch = (neck_c, neck_c, neck_c)
         # instantiate detector
         self.head = DetectHead(num_classes, channels=head_ch, anchors_per_scale=3)
 
@@ -259,15 +262,15 @@ class YOLO11n(nn.Module):
         # stem + stage1
         x = self.stem(x)           # /2
         x = self.stage1_down(x)    # /4
-        p3_in = self.stage1(x)     # p3 candidate
+        p3_in = self.stage1(x)     # p3 candidate (channels = c(32))
 
         # stage2
         x = self.stage2_down(p3_in)  # /8
-        p4_in = self.stage2(x)
+        p4_in = self.stage2(x)       # channels = c(64)
 
         # stage3
         x = self.stage3_down(p4_in)  # /16
-        p5_in = self.stage3(x)
+        p5_in = self.stage3(x)       # channels = c(128)
 
         p5 = self.sppf(p5_in)
 
@@ -279,11 +282,7 @@ class YOLO11n(nn.Module):
         # neck outputs
         out_s, out_m, out_l = self.neck(p3, p4, p5)
 
-        # prepare to head input shapes: convert to desired head channels if needed
-        # (we keep it simple: ensure the feature map channels match head expectations)
-        # If channels mismatch, user can insert small Conv layers here
-        # For now assume out_s channels == head_ch[0], etc, or rely on head's conv to accept existing channels.
-        # We'll pass them directly to DetectHead (it convs from the given channel count).
+        # head expects feature maps with channels matching head_ch defined earlier
         preds = self.head([out_s, out_m, out_l])
         return preds  # list of 3 tensors: (bs, na, gh, gw, no)
 
