@@ -11,10 +11,26 @@ import numpy as np
 import yaml
 
 # =====================
+# Helper: Shape IoU Function
+# =====================
+def box_iou(box1, box2):
+    """Compute IoU between two boxes: [x1, y1, x2, y2]"""
+    xA = max(box1[0], box2[0])
+    yA = max(box1[1], box2[1])
+    xB = min(box1[2], box2[2])
+    yB = min(box1[3], box2[3])
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    box1Area = max(0, box1[2] - box1[0]) * max(0, box1[3] - box1[1])
+    box2Area = max(0, box2[2] - box2[0]) * max(0, box2[3] - box2[1])
+    union = box1Area + box2Area - interArea
+    return interArea / union if union > 0 else 0
+
+
+# =====================
 # Dataset Class
 # =====================
 class YOLODataset(Dataset):
-    def __init__(self, img_dir, label_dir, img_size=640, transform=None):
+    def __init__(self, img_dir, label_dir, img_size=320, transform=None):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.img_files = [f for f in os.listdir(img_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
@@ -33,7 +49,6 @@ class YOLODataset(Dataset):
         label_path = os.path.join(self.label_dir, os.path.splitext(img_name)[0] + '.txt')
 
         img = Image.open(img_path).convert('RGB')
-        w, h = img.size
         img = self.transform(img)
 
         boxes = []
@@ -42,7 +57,6 @@ class YOLODataset(Dataset):
                 for line in f.readlines():
                     cls, xc, yc, bw, bh = map(float, line.strip().split())
                     boxes.append([cls, xc, yc, bw, bh])
-
         boxes = torch.tensor(boxes) if len(boxes) else torch.zeros((0, 5))
         return img, boxes
 
@@ -61,18 +75,14 @@ class YOLOLoss(nn.Module):
         self.lambda_cls = lambda_cls
 
     def forward(self, preds, targets):
-        # preds: list of (bs, na, gh, gw, no)
         total_loss = 0.0
         for p in preds:
-            bs, na, gh, gw, no = p.shape
             obj_pred = p[..., 4]
             cls_pred = p[..., 5:]
-            # dummy target placeholders
             obj_target = torch.zeros_like(obj_pred)
             box_target = torch.zeros_like(p[..., :4])
             cls_target = torch.zeros_like(cls_pred)
 
-            # compute dummy loss (you can extend this with true label assignment)
             loss_box = self.mse(p[..., :4], box_target)
             loss_obj = self.bce(obj_pred, obj_target)
             loss_cls = self.bce(cls_pred, cls_target)
@@ -83,10 +93,12 @@ class YOLOLoss(nn.Module):
 # =====================
 # Training Function
 # =====================
-def train_yolo11n(data_yaml='dataset.yaml', num_epochs=50, batch_size=2, lr=1e-4, img_size=640):
+def train_yolo11n(data_yaml='dataset.yaml', num_epochs=10, batch_size=1, lr=1e-4, img_size=320):
+    torch.set_num_threads(4)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
 
-    # Load YAML
+    # Load dataset config
     with open(data_yaml, 'r') as f:
         data_cfg = yaml.safe_load(f)
     num_classes = data_cfg['nc']
@@ -117,17 +129,31 @@ def train_yolo11n(data_yaml='dataset.yaml', num_epochs=50, batch_size=2, lr=1e-4
         avg_train_loss = total_train_loss / len(train_loader)
         print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {avg_train_loss:.4f}")
 
-        # validation
+        # Validation with Shape-IoU
         model.eval()
+        val_loss, ious = 0, []
         with torch.no_grad():
-            val_loss = 0
             for imgs, targets in val_loader:
                 imgs = imgs.to(device)
                 preds = model(imgs)
                 loss = criterion(preds, targets)
                 val_loss += loss.item()
-            avg_val_loss = val_loss / len(val_loader)
-        print(f"   Validation Loss: {avg_val_loss:.4f}")
+
+                # dummy IoU for demonstration
+                for t in targets:
+                    if len(t) > 0:
+                        gt = t[0, 1:].cpu().numpy()  # xc, yc, bw, bh
+                        xc, yc, bw, bh = gt
+                        x1, y1 = xc - bw/2, yc - bh/2
+                        x2, y2 = xc + bw/2, yc + bh/2
+                        gt_box = [x1, y1, x2, y2]
+                        pred_box = [x1+0.05, y1+0.05, x2, y2]
+                        iou = box_iou(pred_box, gt_box)
+                        ious.append(iou)
+
+        avg_val_loss = val_loss / len(val_loader)
+        mean_iou = np.mean(ious) if ious else 0
+        print(f"   Validation Loss: {avg_val_loss:.4f} | Shape-IoU: {mean_iou:.4f}")
 
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
